@@ -230,11 +230,14 @@ class Spotify(BaseApp):
 
         # --- Button configurations ---
         buttons_config = [
-            ("Next", ["next.png"], (self.center_x + 60, self.height - 100, 80, 100), next_track, update_show_controls),
-            ("Previous", ["previous.png"], (self.center_x - 140, self.height - 100, 80, 100), previous_track, update_show_controls),
-            ("Play", ["play.png", "pause.png"], (self.center_x - 50, self.height - 100, 80, 100), play_pause, update_play_pause),
-            ("Toggle Shuffle", ["shuffle_on.png", "shuffle_off.png"], (self.center_x - 230, self.height - 100, 80, 100), toggle_shuffle, update_shuffle),
-            ("Toggle Repeat", ["repeat_on.png", "repeat_off.png"], (self.center_x + 150, self.height - 100, 80, 100), toggle_repeat, update_repeat),
+            # Transport: play/pause centered, previous/next on the side borders.
+            ("Play", ["play.png", "pause.png"], (self.center_x - 40, self.center_y - 40, 80, 80), play_pause, update_play_pause),
+            ("Previous", ["previous.png"], (0, self.center_y - 40, 80, 80), previous_track, update_show_controls),
+            ("Next", ["next.png"], (self.width - 80, self.center_y - 40, 80, 80), next_track, update_show_controls),
+            # Shuffle/repeat clustered in the top-left corner.
+            ("Toggle Shuffle", ["shuffle_on.png", "shuffle_off.png"], (0, 0, 80, 80), toggle_shuffle, update_shuffle),
+            ("Toggle Repeat", ["repeat_on.png", "repeat_off.png"], (80, 0, 80, 80), toggle_repeat, update_repeat),
+            # Light stays in the top-right corner.
             ("Toggle Light", ["light_on.png", "light_off.png"], (self.width - 100, 0, 100, 80), toggle_lights, update_light),
             ("Toggle Controls", None, (0, 0, self.width, self.height), toggle_controls, update_always_enabled),
         ]
@@ -408,35 +411,31 @@ class Spotify(BaseApp):
         except OSError:
             print("Failed to load image.")
 
-    def write_track(self):
-        """Writes the track name and artists on the screen."""
-        if self.state.show_controls and self.state.track:
-            self.display.set_thickness(3)
+    def _write_centered(self, text, y, scale, thickness):
+        """Draws white text with a shadow, horizontally centered."""
+        self.display.set_thickness(thickness)
+        x = (self.width - self.display.measure_text(text, scale=scale)) // 2
+        self.display.set_pen(self.colors._BLACK)
+        self.display.text(text, x + 2, y + 3, scale=scale)
+        self.display.set_pen(self.colors.WHITE)
+        self.display.text(text, x, y, scale=scale)
 
-            track_name = self.state.track.get("name")
-            # strip non-ascii characters
+    def write_track(self):
+        """Writes the track name and artists centered along the bottom border."""
+        if self.state.show_controls and self.state.track:
+            track_name = self.state.track.get("name") or ""
             track_name = ''.join(i if ord(i) < 128 else ' ' for i in track_name)
             if len(track_name) > 20:
                 track_name = track_name[:20] + " ..."
-            # shadow effect
-            self.display.set_pen(self.colors._BLACK)
-            self.display.text(track_name, 20, self.height - 137, scale=1.1)
+            # "sans" is a vector font drawn from the baseline, so these y values are
+            # where each line's baseline sits — chosen to center the block in the band.
+            self._write_centered(track_name, self.height - 42, 1.1, 3)
 
-            self.display.set_pen(self.colors.WHITE)
-            self.display.text(track_name, 18, self.height - 140, scale=1.1)
-
-            artists = ", ".join([artist.get("name") for artist in self.state.track.get("artists")])
-            # strip non-ascii characters
+            artists = ", ".join(a.get("name") for a in (self.state.track.get("artists") or []))
             artists = ''.join(i if ord(i) < 128 else ' ' for i in artists)
             if len(artists) > 35:
                 artists = artists[:35] + " ..."
-            self.display.set_thickness(2)
-            # shadow effect
-            self.display.set_pen(self.colors._BLACK)
-            self.display.text(artists, 20, self.height - 108, scale=0.7)
-
-            self.display.set_pen(self.colors.WHITE)
-            self.display.text(artists, 18, self.height - 111, scale=0.7)
+            self._write_centered(artists, self.height - 16, 0.7, 2)
 
     async def display_loop(self):
         """Renders the latest track info and controls (network-free).
