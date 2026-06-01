@@ -4,6 +4,19 @@
 
 PrestoDeck is a Spotify music controller for the Pimoroni Presto. It displays the album cover art, name, and artist of the currently playing track and provides basic controls for playback.
 
+## What's new in this fork
+
+This fork reworks the app for a much more responsive UI. All network I/O now runs on its own cooperative `asyncio` task using non-blocking TLS sockets, so polling and album-art downloads no longer freeze touch or rendering. Highlights:
+
+- **Non-blocking networking** — a custom async HTTP/TLS client (`spotify_client.py`) with a keep-alive connection to `api.spotify.com`, replacing blocking `urequests`. The TLS handshake is paid once instead of on every poll.
+- **Optimistic controls** — play/pause/shuffle/repeat update the UI instantly and reconcile with the next poll (a short window prevents not-yet-applied polls from reverting them).
+- **Instant Next/Back** — the upcoming track is prefetched from the play queue and the previous track is cached, so skips update title *and* cover art immediately; a stale-track suppressor avoids flip-revert-flip during Spotify's propagation delay.
+- **Cover art direct from Spotify's CDN** — no more `wsrv.nl` proxy hop; decoded at half scale and centered.
+- **Edge-triggered touch** — one tap = one action (fixes erratic control toggling).
+- **Misc** — ambient LEDs off by default, removed the dead "Exit" button, less frequent `gc.collect()`.
+
+> Note: the Pimoroni Presto firmware reserves the second core for the display, so `_thread` is unavailable — concurrency here is single-core cooperative `asyncio`, not multicore.
+
 ## Hardware
 
 - [Pimoroni Presto](https://collabs.shop/xbvgb2)
