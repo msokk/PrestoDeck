@@ -139,6 +139,32 @@ async def fetch_url(url):
         await conn.close()
 
 
+async def exchange_code(client_id, code, code_verifier, redirect_uri):
+    """Exchanges an authorization code for tokens (PKCE, no client secret).
+
+    Used once during on-device setup; returns the parsed token dict
+    (access_token, refresh_token, ...). Raises on a non-2xx response."""
+    body = urlencode(dict(
+        grant_type="authorization_code",
+        code=code,
+        redirect_uri=redirect_uri,
+        client_id=client_id,
+        code_verifier=code_verifier,
+    )).encode()
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    conn = Connection("accounts.spotify.com")
+    try:
+        status, _, resp_body = await conn.request("POST", "/api/token", headers, body)
+        if status >= 400:
+            raise SpotifyWebApiError(
+                "Token exchange failed: HTTP {} {}".format(status, resp_body), status=status
+            )
+        return json.loads(resp_body)
+    finally:
+        await conn.close()
+
+
 class SpotifyWebApiClient:
     def __init__(self, session):
         self.session = session
@@ -174,10 +200,14 @@ class SpotifyWebApiClient:
 
 
 class Session:
-    def __init__(self, credentials):
+    def __init__(self, credentials, on_credentials_changed=None):
         self.credentials = credentials
         self.device_id = credentials["device_id"]
         self.api = Connection("api.spotify.com")  # kept alive for the hot path
+        # Called when the refresh token rotates so the caller can persist it.
+        # PKCE rotates the refresh token on every refresh and revokes the old
+        # one, so a not-persisted rotation breaks auth on the next reboot.
+        self.on_credentials_changed = on_credentials_changed
 
     async def get(self, url):
         return await self._request("GET", url, add_device=False)
@@ -259,12 +289,16 @@ class Session:
         )
 
     async def _refresh_access_token(self):
-        body = urlencode(dict(
+        # PKCE clients have no client_secret: refresh with client_id only. The
+        # classic flow (legacy secrets) still sends the secret when present.
+        params = dict(
             grant_type="refresh_token",
             refresh_token=self.credentials["refresh_token"],
             client_id=self.credentials["client_id"],
-            client_secret=self.credentials["client_secret"],
-        )).encode()
+        )
+        if self.credentials.get("client_secret"):
+            params["client_secret"] = self.credentials["client_secret"]
+        body = urlencode(params).encode()
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
         conn = Connection("accounts.spotify.com")
@@ -275,8 +309,14 @@ class Session:
                     if status < 400:
                         tokens = json.loads(resp_body)
                         self.credentials["access_token"] = tokens["access_token"]
-                        if "refresh_token" in tokens:
-                            self.credentials["refresh_token"] = tokens["refresh_token"]
+                        new_rt = tokens.get("refresh_token")
+                        if new_rt and new_rt != self.credentials.get("refresh_token"):
+                            self.credentials["refresh_token"] = new_rt
+                            if self.on_credentials_changed:
+                                try:
+                                    self.on_credentials_changed(self.credentials)
+                                except Exception as e:
+                                    print("Failed to persist rotated refresh token:", e)
                         return
                 except Exception as e:
                     print("Failed to refresh access token, retrying:", e)

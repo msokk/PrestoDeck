@@ -10,7 +10,10 @@ from presto import Buzzer
 
 from applications.spotify.spotify_client import Session, SpotifyWebApiClient, fetch_url
 from applications.spotify.secrets_loader import load_secrets
+from applications.spotify.config_store import load_user_config, save_user_config, clear_user_config, is_configured
 from base import BaseApp
+
+RESET_HOLD_MS = 10_000  # hold the Light button this long to wipe config and reboot
 
 DEBUG = False  # set True to print the [net]/[skip] timing logs over serial
 
@@ -108,9 +111,11 @@ class ControlButton():
 
 class Spotify(BaseApp):
     """Main Spotify app managing playback controls, track display, and UI interactions."""
-    def __init__(self):
+    def __init__(self, wifi_ssid, wifi_password, credentials, persist=None):
         super().__init__(ambient_light=True, full_res=True, layers=2)
         self.toggle_leds(False)  # ambient LEDs off at boot (no glow during connect)
+        self.credentials = credentials
+        self._persist = persist  # called when the refresh token rotates
 
         self.display.set_layer(0)
         icon = pngdec.PNG(self.display)
@@ -123,14 +128,10 @@ class Spotify(BaseApp):
         self.display_text("Connecting to WIFI", (90, self.height - 80), thickness=2)
         self.presto.update()
 
-        # Credentials come from /sd/secrets.json if present, else secrets.py.
-        self.secrets = load_secrets()
-
-        # Pass WiFi creds explicitly so SD-sourced ones work without a secrets.py;
+        # WiFi creds come from /config.json (set during setup) or legacy secrets.
         # connect() with no args would force the firmware to read secrets.py.
-        ssid = getattr(self.secrets, "WIFI_SSID", None)
-        if ssid:
-            self.presto.connect(ssid, getattr(self.secrets, "WIFI_PASSWORD", None))
+        if wifi_ssid:
+            self.presto.connect(wifi_ssid, wifi_password)
         else:
             self.presto.connect()
         while not self.presto.wifi.isconnected():
@@ -162,6 +163,8 @@ class Spotify(BaseApp):
         self.state = State()
         self.shared = Shared()
         self.setup_buttons()
+        # The Light (top-right) button doubles as the hidden config-reset gesture.
+        self._light_btn = next((b for b in self.buttons if b.name == "Toggle Light"), None)
 
     def display_text(self, text, position, color=65535, scale=1, thickness=None):
         if thickness:
@@ -172,17 +175,7 @@ class Spotify(BaseApp):
         self.presto.update()
 
     def get_spotify_client(self):
-        credentials = getattr(self.secrets, 'SPOTIFY_CREDENTIALS', None)
-        if not credentials:
-            while True:
-                self.clear(1)
-                self.display.set_pen(self.colors.WHITE)
-                self.display.text("Spotify credentials not found", 40, self.height - 80, scale=.9)
-                self.presto.update()
-                time.sleep(2)
-
-        session = Session(credentials)
-        return SpotifyWebApiClient(session)
+        return SpotifyWebApiClient(Session(self.credentials, on_credentials_changed=self._persist))
 
     def setup_buttons(self):
         """Initializes control buttons and their behavior."""
@@ -429,6 +422,8 @@ class Spotify(BaseApp):
         Edge-triggered: act only on the untouched->touched transition so a single
         tap produces exactly one action (the firmware's is_pressed() is level-based)."""
         was_touching = False
+        hold_start = 0
+        led_feedback = False
         while not self.state.exit:
             self.touch.poll()
             touching = self.touch.state
@@ -444,9 +439,42 @@ class Spotify(BaseApp):
                         except Exception as e:
                             print(f"Failed to execute on_press: {e}")
                         break
+
+            # Hidden reset: hold the Light corner (geometry only, regardless of
+            # whether controls are shown) for RESET_HOLD_MS to wipe config + reboot.
+            if touching and self._light_btn and self._light_btn.button.is_pressed():
+                if hold_start == 0:
+                    hold_start = time.ticks_ms()
+                held = time.ticks_diff(time.ticks_ms(), hold_start)
+                if held > 1500:  # ramp the LEDs red as a "keep holding" cue
+                    led_feedback = True
+                    lit = min(7, 1 + held * 7 // RESET_HOLD_MS)
+                    for i in range(7):
+                        self.presto.set_led_rgb(i, 120 if i < lit else 0, 0, 0)
+                if held >= RESET_HOLD_MS:
+                    self._do_reset()
+            else:
+                hold_start = 0
+                if led_feedback:
+                    led_feedback = False
+                    self.toggle_leds(self.state.toggle_leds)  # restore prior LED state
+
             was_touching = touching
 
             await asyncio.sleep_ms(1)
+
+    def _do_reset(self):
+        """Wipes the user config and reboots into the setup flow."""
+        print("Config reset requested: clearing /config.json and rebooting")
+        clear_user_config()
+        self.clear(1)
+        self.display.set_pen(self.colors.WHITE)
+        self.display.set_thickness(2)
+        self.display.text("Resetting...", 130, self.center_y, scale=1.0)
+        self.presto.update()
+        time.sleep(1)
+        import machine
+        machine.reset()
 
     def show_image(self, img, fullscreen=False):
         """Displays an album cover image.
@@ -614,9 +642,55 @@ async def get_album_cover(track):
 
     return None
 
+def _resolve_boot():
+    """Decides whether to run the app or the setup flow.
+
+    Returns ("run", (wifi_ssid, wifi_password, credentials, persist)) or
+    ("setup", (client_id, config)). The provisioned client_id lives in the
+    gitignored secrets source; WiFi + refresh token live in /config.json. The
+    persist callback writes rotated PKCE refresh tokens back to flash (None for
+    the legacy path, which has no /config.json to update)."""
+    secrets = load_secrets()
+    client_id = getattr(secrets, "SPOTIFY_CLIENT_ID", None)
+    legacy = getattr(secrets, "SPOTIFY_CREDENTIALS", None)
+    config = load_user_config()
+
+    # Back-compat: a full pre-generated credentials dict boots directly.
+    if legacy:
+        return "run", (getattr(secrets, "WIFI_SSID", None),
+                       getattr(secrets, "WIFI_PASSWORD", None), legacy, None)
+
+    if is_configured(config):
+        credentials = {
+            "client_id": client_id,
+            "refresh_token": config["refresh_token"],
+            "device_id": config.get("device_id"),
+        }
+        return "run", (config.get("wifi_ssid"), config.get("wifi_password"),
+                       credentials, _persist_refresh_token)
+
+    return "setup", (client_id, config)
+
+
+def _persist_refresh_token(credentials):
+    """Writes a rotated refresh token back to /config.json so it survives reboots."""
+    config = load_user_config() or {}
+    config["refresh_token"] = credentials.get("refresh_token")
+    save_user_config(config)
+
+
 def launch():
-    """Launches the Spotify app and starts the event loop."""
-    app = Spotify()
+    """Runs the setup flow if unconfigured, otherwise the Spotify app."""
+    mode, args = _resolve_boot()
+
+    if mode == "setup":
+        from applications.spotify.setup import SetupApp
+        client_id, config = args
+        app = SetupApp(client_id, config)
+        asyncio.get_event_loop().run_until_complete(app.run())  # ends by rebooting
+        return
+
+    app = Spotify(*args)
     app.run()
 
     app.clear()

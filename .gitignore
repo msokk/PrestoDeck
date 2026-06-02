@@ -180,3 +180,6 @@ cython_debug/
 src/secrets.py
 # SD-card credentials (copy secrets.json.example to the card's /sd/secrets.json)
 src/secrets.json
+# User config written by the on-device setup flow (WiFi password + Spotify token)
+src/config.json
+config.json

@@ -15,9 +15,14 @@ PrestoDeck — a Spotify controller for the **Pimoroni Presto** (RP2350), writte
 - `mpremote cp src/applications/spotify/spotify.py :applications/spotify/spotify.py` — push one file (device FS = contents of `src/` at root).
 - `mpremote reset && mpremote repl` — reboot and watch serial output (the app `print()`s state/errors).
 
-## Secrets
+## Secrets & on-device setup
 
-- `src/secrets.py` is **gitignored**; `src/secrets.py.example` is the template. It holds real WiFi/Spotify credentials — **never commit it**; avoid `git add -A` / `git commit -a`.
+- **Two storage tiers.** Provisioned-by-owner: only `SPOTIFY_CLIENT_ID` (the shared Spotify app identity) lives in the **gitignored** `secrets` source (`src/secrets.py` or `/sd/secrets.json`; `*.example` are templates) — **never commit it**, avoid `git add -A` / `git commit -a`. User-configured: WiFi creds + Spotify `refresh_token` are written by the setup flow to **`/config.json` on internal flash** (`config_store.py`) — this is the tier the reset gesture wipes.
+- **Self-serve setup flow** (`setup.py`, `setup_server.py`, `keyboard.py`): on first boot (no usable `/config.json`), `launch()` runs `SetupApp` instead of `Spotify`. Step 1 — scan WiFi, pick SSID, type password on the on-screen keyboard (masked field has a Show/Hide eye, visible by default). Step 2 — the device runs an HTTP server (`asyncio.start_server`, port 8080) and shows its `http://<ip>:8080` URL; the user opens it on a phone and taps "Connect Spotify". (mDNS/`prestodeck.local` was dropped — unreliable on RP2; the shown IP is used.)
+- **PKCE token rotation must persist:** Spotify rotates the refresh token on every refresh and revokes the old one. `Session(on_credentials_changed=...)` writes the rotated token back to `/config.json` (`_persist_refresh_token` in `spotify.py`), else auth dies on the next reboot. `/callback` is idempotent — replaying a single-use auth code makes Spotify revoke the issued tokens.
+- **OAuth is PKCE, no client secret.** Spotify only allows `http://` redirect URIs for the literal loopback `127.0.0.1`, so the device can't be the registered redirect. A static GitHub Pages helper (`docs/cb/index.html`, served at `HELPER_REDIRECT` in `setup_server.py`) is registered instead; it bounces the phone back to `http://<ip>:8080/callback` via a **top-level navigation** (exempt from mixed-content rules), carrying the device `ip:port` in the OAuth `state`. Register that helper URL as the Redirect URI in the Spotify app; allowlist friends' emails (Dev Mode = 25 users).
+- **Reset:** hold the Light (top-right) button ~10s (`RESET_HOLD_MS`) → `clear_user_config()` + `machine.reset()` back into setup. The `client_id` survives.
+- Legacy `SPOTIFY_CREDENTIALS` (full dict from `adhoc/generate_token.sh`) in secrets still boots directly, bypassing setup.
 - Remotes: `origin` = personal fork (msokk), `upstream` = fatihak/PrestoDeck.
 
 ## Architecture (spotify.py)
@@ -37,3 +42,4 @@ PrestoDeck — a Spotify controller for the **Pimoroni Presto** (RP2350), writte
 - PicoGraphics **vector fonts** (`"sans"`) are positioned by the **baseline**, not top-left (bitmap fonts use top-left). Use `display.measure_text(text, scale)` to center horizontally.
 - `jpegdec` only scales by **powers of two** (FULL/HALF/QUARTER/EIGHTH) — no arbitrary resize. Cover art is Spotify's 640px decoded at HALF (~320px), centered.
 - Two display layers: layer 0 = cover art, layer 1 = controls/text. `presto.update()` only flushes on a render — force one when a new cover decodes, else it stays in the buffer.
+- Setup/OAuth relies on firmware modules `hashlib.sha256` (PKCE needs S256; Spotify rejects `plain`), `os.urandom`, `binascii`, `asyncio.start_server`, and `network.WLAN(STA_IF).scan()` — all verified present on the Presto 1.26 firmware. Setup connects via the **raw `network.WLAN` STA interface**, not `presto.connect()` (EzWiFi blocks the cooperative loop and can't be interrupted).
