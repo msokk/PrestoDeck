@@ -1,14 +1,18 @@
 import gc
 import time
+import network
 import jpegdec
 import pngdec
 import uasyncio as asyncio
 
 from touch import Button
+from presto import Buzzer
 
 from applications.spotify.spotify_client import Session, SpotifyWebApiClient, fetch_url
+from applications.spotify.secrets_loader import load_secrets
 from base import BaseApp
-import secrets
+
+DEBUG = False  # set True to print the [net]/[skip] timing logs over serial
 
 class State:
     """Tracks the current state of the Spotify app including playback and UI controls."""
@@ -119,11 +123,29 @@ class Spotify(BaseApp):
         self.display_text("Connecting to WIFI", (90, self.height - 80), thickness=2)
         self.presto.update()
 
-        self.presto.connect()
+        # Credentials come from /sd/secrets.json if present, else secrets.py.
+        self.secrets = load_secrets()
+
+        # Pass WiFi creds explicitly so SD-sourced ones work without a secrets.py;
+        # connect() with no args would force the firmware to read secrets.py.
+        ssid = getattr(self.secrets, "WIFI_SSID", None)
+        if ssid:
+            self.presto.connect(ssid, getattr(self.secrets, "WIFI_PASSWORD", None))
+        else:
+            self.presto.connect()
         while not self.presto.wifi.isconnected():
             self.clear(1)
             self.display_text("Failed to connect to WIFI", (40, self.height - 80), thickness=2)
             time.sleep(2)
+
+        # Disable WiFi power-save: the radio otherwise parks between beacons and adds
+        # latency to requests. We're mains-powered, so keep it awake. Go through the
+        # raw STA interface — presto.wifi is an EzWiFi wrapper with no config().
+        try:
+            wlan = network.WLAN(network.STA_IF)
+            wlan.config(pm=getattr(network.WLAN, "PM_NONE", 0xa11140))
+        except Exception as e:
+            print("Could not disable WiFi power-save:", e)
 
         self.clear(1)
         self.display_text("Instantiating Spotify Client", (35, self.height - 80), thickness=2)
@@ -133,6 +155,9 @@ class Spotify(BaseApp):
 
         # JPEG decoder
         self.j = jpegdec.JPEG(self.display)
+
+        # Piezo buzzer (Presto's is on GPIO 43) for tactile press feedback.
+        self.buzzer = Buzzer(43)
 
         self.state = State()
         self.shared = Shared()
@@ -147,7 +172,8 @@ class Spotify(BaseApp):
         self.presto.update()
 
     def get_spotify_client(self):
-        if not hasattr(secrets, 'SPOTIFY_CREDENTIALS') or not secrets.SPOTIFY_CREDENTIALS:
+        credentials = getattr(self.secrets, 'SPOTIFY_CREDENTIALS', None)
+        if not credentials:
             while True:
                 self.clear(1)
                 self.display.set_pen(self.colors.WHITE)
@@ -155,7 +181,7 @@ class Spotify(BaseApp):
                 self.presto.update()
                 time.sleep(2)
 
-        session = Session(secrets.SPOTIFY_CREDENTIALS)
+        session = Session(credentials)
         return SpotifyWebApiClient(session)
 
     def setup_buttons(self):
@@ -260,6 +286,15 @@ class Spotify(BaseApp):
         """Queues a network command for the network task."""
         self.shared.commands.append(command)
 
+    async def _buzz(self, freq=1000, ms=30, duty=0.5):
+        """Plays a brief tone for tactile press feedback, then silences the piezo.
+
+        Spawned as a fire-and-forget task so the touch handler never blocks; if taps
+        overlap, the last buzz to finish silences (set_tone(-1) zeroes the duty)."""
+        self.buzzer.set_tone(freq, duty)
+        await asyncio.sleep_ms(ms)
+        self.buzzer.set_tone(-1)
+
     async def _execute_command(self, command):
         """Runs a queued network command (async, non-blocking HTTP)."""
         action = command[0]
@@ -276,14 +311,16 @@ class Spotify(BaseApp):
 
     async def _publish_playback(self, result):
         """Publishes a fetched playback state to the UI and downloads the cover
-        on track change. Returns the new track id."""
+        on track change. Returns True if the track changed (so the caller can
+        refresh the queue only then, instead of on every poll)."""
         device_id, track, is_playing, shuffle, repeat = result
         if device_id:
             self.spotify_client.session.device_id = device_id
 
         track_id = track.get("id")
+        changed = (self._published_track or {}).get("id") != track_id
         # Remember the outgoing track + its cover so "previous" can show both instantly.
-        if self._published_track and self._published_track.get("id") != track_id:
+        if self._published_track and changed:
             self.shared.prev_track = self._published_track
             self.shared.prev_cover = self._published_cover
         self._published_track = track
@@ -306,7 +343,7 @@ class Spotify(BaseApp):
                 self.shared.cover = cover
         if cover:
             self._published_cover = cover
-        return track_id
+        return changed
 
     async def _refresh_queue(self):
         """Caches the upcoming track and its cover so 'next' shows both instantly."""
@@ -328,7 +365,7 @@ class Spotify(BaseApp):
         """Owns all network I/O: executes queued commands, polls playback, and
         downloads cover art. Runs as its own asyncio task so command/cover work is
         decoupled from the render cadence and button presses stay optimistic."""
-        INTERVAL = 2
+        INTERVAL = 3  # seconds between steady-state polls; button presses stay optimistic
         last_fetch = 0
         self._published_track = None
         self._published_cover = None
@@ -336,6 +373,7 @@ class Spotify(BaseApp):
         while not self.state.exit:
             # Drain queued button commands and run them.
             commands, self.shared.commands = self.shared.commands, []
+            did_work = bool(commands)
             skipped = False
             for command in commands:
                 try:
@@ -352,23 +390,37 @@ class Spotify(BaseApp):
                 # Spotify reflects the change to confirm it and fetch the right cover; only
                 # publish on a real change so a slow transition can't revert the optimism.
                 prev_id = self.shared.playback[0].get("id") if self.shared.playback else None
-                for _ in range(12):  # up to ~3.6s
+                t0 = time.ticks_ms()
+                confirmed = False
+                for i in range(12):  # up to ~3.6s
                     result = await fetch_state(self.spotify_client)
                     if result and result[1].get("id") != prev_id:
                         await self._publish_playback(result)
+                        confirmed = True
                         break
                     await asyncio.sleep_ms(300)
+                if DEBUG:
+                    elapsed = time.ticks_diff(time.ticks_ms(), t0)
+                    print("[skip] {} after {} poll(s), {}ms".format(
+                        "confirmed" if confirmed else "TIMED OUT", i + 1, elapsed))
                 await self._refresh_queue()
                 last_fetch = time.time()
             elif self.shared.force_fetch or now - last_fetch >= INTERVAL:
                 self.shared.force_fetch = False
                 last_fetch = now
+                did_work = True
                 result = await fetch_state(self.spotify_client)
-                if result:
-                    await self._publish_playback(result)
+                # Only refetch the queue (a ~47KB payload) when the track actually
+                # changed, not on every poll — the upcoming track is otherwise stable.
+                if result and await self._publish_playback(result):
                     await self._refresh_queue()
 
-            gc.collect()
+            # Collect only after real work. A full gc.collect() scans the entire 8MB
+            # heap (~100ms) regardless of garbage, so running it every idle iteration
+            # would peg the single core and stall in-flight network reads.
+            if did_work:
+                self.buzzer.set_tone(-1)  # don't let a press beep tail span the collect
+                gc.collect()
             await asyncio.sleep_ms(50)
 
     async def touch_handler_loop(self):
@@ -386,6 +438,7 @@ class Spotify(BaseApp):
                     button.update(self.state, button)
                     if button.is_pressed(self.state):
                         print(f"{button.name} pressed")
+                        asyncio.create_task(self._buzz())  # brief tactile feedback
                         try:
                             button.on_press(self)
                         except Exception as e:
@@ -395,18 +448,30 @@ class Spotify(BaseApp):
 
             await asyncio.sleep_ms(1)
 
-    def show_image(self, img, minimized=False):
-        """Displays an album cover image, decoded at half scale and centered."""
+    def show_image(self, img, fullscreen=False):
+        """Displays an album cover image.
+
+        With controls hidden (fullscreen), decode Spotify's 640px art at full scale
+        and center-crop it to fill the 480px screen (the overflow clips off-screen).
+        With controls shown, decode at half (~320px) and center with a border so the
+        controls living in that border stay visible. jpegdec only scales by powers of two."""
         try:
             self.j.open_RAM(memoryview(img))
 
-            # jpegdec only scales by powers of two; the cover is Spotify's 640px art
-            # decoded at half (~320px) and centered with a border on the 480px screen.
-            img_width, img_height = self.j.get_width() // 2, self.j.get_height() // 2
+            if fullscreen:
+                scale = jpegdec.JPEG_SCALE_FULL
+                img_width, img_height = self.j.get_width(), self.j.get_height()
+            else:
+                scale = jpegdec.JPEG_SCALE_HALF
+                img_width, img_height = self.j.get_width() // 2, self.j.get_height() // 2
             img_x, img_y = (self.width - img_width) // 2, (self.height - img_height) // 2
 
             self.clear(0)
-            self.j.decode(img_x, img_y, jpegdec.JPEG_SCALE_HALF, dither=True)
+            # Silence any in-flight press beep before the decode: it blocks the single
+            # core for hundreds of ms, which would otherwise stretch the tone (the buzz
+            # task can't run its own set_tone(-1) until the core is free again).
+            self.buzzer.set_tone(-1)
+            self.j.decode(img_x, img_y, scale, dither=True)
 
         except OSError:
             print("Failed to load image.")
@@ -421,8 +486,10 @@ class Spotify(BaseApp):
         self.display.text(text, x, y, scale=scale)
 
     def write_track(self):
-        """Writes the track name and artists centered along the bottom border."""
-        if self.state.show_controls and self.state.track:
+        """Writes the track name and artists centered along the bottom border.
+
+        Always shown (shadowed text stays legible over the full-screen cover too)."""
+        if self.state.track:
             track_name = self.state.track.get("name") or ""
             track_name = ''.join(i if ord(i) < 128 else ' ' for i in track_name)
             if len(track_name) > 20:
@@ -445,7 +512,7 @@ class Spotify(BaseApp):
         prev_state = None
         last_seq = -1
         last_cover_id = None
-        gc_counter = 0
+        last_fullscreen = None
 
         while not self.state.exit:
             # Pull the latest playback snapshot from the network task.
@@ -471,12 +538,15 @@ class Spotify(BaseApp):
 
             await asyncio.sleep(0)
 
-            # Decode the new cover (layer 0) once the network task has downloaded it.
+            # Decode the cover (layer 0) on a new download, or re-decode at the other
+            # scale when controls toggle (full-screen crop hidden vs. bordered shown).
             cover_updated = False
+            fullscreen = not self.state.show_controls
             cover = self.shared.cover
-            if cover and cover[0] != last_cover_id:
+            if cover and (cover[0] != last_cover_id or fullscreen != last_fullscreen):
                 last_cover_id, img = cover
-                self.show_image(img)
+                last_fullscreen = fullscreen
+                self.show_image(img, fullscreen=fullscreen)
                 cover_updated = True
 
             await asyncio.sleep(0)
@@ -493,9 +563,9 @@ class Spotify(BaseApp):
                 self.presto.update()
                 prev_state = self.state.copy()
 
-            gc_counter += 1
-            if gc_counter >= 10:
-                gc_counter = 0
+            # Collect only after a cover decode (the one big transient allocation here);
+            # the per-poll collect in network_loop reclaims everything else globally.
+            if cover_updated:
                 gc.collect()
             await asyncio.sleep_ms(120)
 

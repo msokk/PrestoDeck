@@ -1,6 +1,9 @@
 import asyncio
 import json
+import time
 import tls
+
+DEBUG = False  # set True to print the [net] request-timing log over serial
 
 
 def _split_url(url):
@@ -47,11 +50,21 @@ class Connection:
 
     async def request(self, method, path, headers=None, body=None):
         # Reconnect once if the kept-alive socket has gone stale.
+        t0 = time.ticks_ms() if DEBUG else 0
         for attempt in range(2):
             try:
-                if self.writer is None:
+                reconnected = self.writer is None
+                if reconnected:
                     await self._connect()
-                return await self._do_request(method, path, headers, body)
+                status, resp_headers, resp_body = await self._do_request(method, path, headers, body)
+                if DEBUG:
+                    # Timing log to spot slow responses; a "+TLS" reconnect pays the
+                    # handshake cost and is the usual cause of an occasional spike.
+                    elapsed = time.ticks_diff(time.ticks_ms(), t0)
+                    print("[net] {} {}{} -> {} {}B {}ms{}".format(
+                        method, self.host, path.split("?", 1)[0], status,
+                        len(resp_body), elapsed, " +TLS" if reconnected else ""))
+                return status, resp_headers, resp_body
             except Exception:
                 await self.close()
                 if attempt == 1:

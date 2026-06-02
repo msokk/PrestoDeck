@@ -178,3 +178,5 @@ cython_debug/
 
 # Local credentials — copy secrets.py.example to secrets.py and fill in
 src/secrets.py
+# SD-card credentials (copy secrets.json.example to the card's /sd/secrets.json)
+src/secrets.json
