@@ -2,8 +2,9 @@
 
 MicroPython's filesystem (LittleFS on the RP2350's flash) is writable, so the
 setup flow stores the user's WiFi credentials and the Spotify refresh token here
-at /config.json. This is the tier that the 10s long-press reset wipes; the
-Spotify client_id stays in the provisioned secrets source (see secrets_loader).
+at /config.json, alongside UI prefs set on the settings screen (backlight,
+control_sounds). This is the tier the settings-screen reset wipes; the Spotify
+client_id stays in the provisioned secrets source (see secrets_loader).
 """
 
 import json
